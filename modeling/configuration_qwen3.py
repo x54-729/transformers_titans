@@ -22,7 +22,7 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class Qwen3Config(PretrainedConfig):
+class Qwen3MACConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3Model`]. It is used to instantiate a
     Qwen3 model according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -133,7 +133,8 @@ class Qwen3Config(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "qwen3"
+    model_type = "qwen3_mac"
+    _auto_class = "AutoConfig"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # Default tensor parallel plan for base model `Qwen3`

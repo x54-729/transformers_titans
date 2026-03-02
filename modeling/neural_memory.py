@@ -516,12 +516,12 @@ class BatchNeuralMemory(nn.Module):
             x = F.pad(x, (0, 0, 0, pad_seq_len-seq_len), value=self.config.pad_token_id)
 
         # B, N, C, D
-        x = x.view(bsz, num_chunks, self.chunk_size, hidden_size)
+        x = x.view(bsz, num_chunks, self.chunk_size, hidden_size).contiguous()
         
         # Get gate, lr, momentum for every batch and chunk
         # B, N, 1
         # B, N, C*D
-        x_c = x.view(bsz, num_chunks, self.chunk_size*hidden_size)
+        x_c = x.view(bsz, num_chunks, self.chunk_size*hidden_size).contiguous()
         alpha = self.alpha(x_c).sigmoid()
         theta = self.theta(x_c).sigmoid() * self.base_lr
         eta = self.eta(x_c).sigmoid()

@@ -44,7 +44,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
-from .configuration_qwen3 import Qwen3Config
+from .configuration_qwen3 import Qwen3MACConfig
 from .neural_memory import BatchNeuralMemory, debug_print
 
 
@@ -160,7 +160,7 @@ def eager_attention_forward(
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3MACConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -233,11 +233,11 @@ class Qwen3Attention(nn.Module):
         return attn_output
 
 
-class Qwen3DecoderLayer(GradientCheckpointingLayer):
+class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
     """
     Qwen3 Decoder Layer with MAC
     """
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3MACConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -293,8 +293,18 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             ).unsqueeze(0)
             position_embeddings = self.rotary_emb(concat_states, position_ids)
 
+            
+            # bsz, seq_len with True and False
+            if attention_mask is not None:
+                assert len(attention_mask.shape) == 2, attention_mask.shape
             # causal mask for originial x
-            post_mask = sdpa_mask(bsz, cache_position=position_ids.squeeze(0)[:cur_segment_len], kv_length=cur_segment_len, allow_is_causal_skip=False)
+            post_mask = sdpa_mask(
+                bsz,
+                cache_position=position_ids.squeeze(0)[:cur_segment_len],
+                kv_length=cur_segment_len,
+                allow_is_causal_skip=False,
+                attention_mask=attention_mask[:, i*self.segment_len:(i+1)*self.segment_len]
+            )
             # The sliding window alternating layers are not always activated depending on the config
             if self.attention_type == "sliding_attention":
                 raise NotImplementedError
@@ -336,11 +346,11 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 @auto_docstring
-class Qwen3PreTrainedModel(PreTrainedModel):
-    config: Qwen3Config
+class Qwen3MACPreTrainedModel(PreTrainedModel):
+    config: Qwen3MACConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3DecoderLayer"]
+    _no_split_modules = ["Qwen3MACDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -349,7 +359,7 @@ class Qwen3PreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": Qwen3DecoderLayer,
+        "hidden_states": Qwen3MACDecoderLayer,
         "attentions": Qwen3Attention,
     }
 
@@ -357,7 +367,7 @@ class Qwen3PreTrainedModel(PreTrainedModel):
 class Qwen3RotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: Qwen3Config, device=None):
+    def __init__(self, config: Qwen3MACConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
@@ -395,15 +405,16 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 @auto_docstring
-class Qwen3Model(Qwen3PreTrainedModel):
-    def __init__(self, config: Qwen3Config):
+class Qwen3MACModel(Qwen3MACPreTrainedModel):
+    _auto_class = "AutoModel"
+    def __init__(self, config: Qwen3MACConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3MACDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
@@ -465,14 +476,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
 
 @auto_docstring
-class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
+    _auto_class = "AutoModelForCausalLM"
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3MACModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -545,23 +557,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
-class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
+class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3MACPreTrainedModel):
     pass
 
 
-class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrainedModel):
+class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3MACPreTrainedModel):
     pass
 
 
-class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
+class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3MACPreTrainedModel):
     base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
 
 
 __all__ = [
-    "Qwen3ForCausalLM",
-    "Qwen3ForQuestionAnswering",
-    "Qwen3PreTrainedModel",
-    "Qwen3Model",
-    "Qwen3ForSequenceClassification",
-    "Qwen3ForTokenClassification",
+    "Qwen3MACForCausalLM",
+    # "Qwen3ForQuestionAnswering",
+    "Qwen3MACPreTrainedModel",
+    "Qwen3MACModel",
+    # "Qwen3ForSequenceClassification",
+    # "Qwen3ForTokenClassification",
 ]

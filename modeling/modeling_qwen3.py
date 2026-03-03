@@ -297,13 +297,16 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
             # bsz, seq_len with True and False
             if attention_mask is not None:
                 assert len(attention_mask.shape) == 2, attention_mask.shape
+                origin_mask = attention_mask[:, i*self.segment_len:(i+1)*self.segment_len]
+            else:
+                origin_mask = None
             # causal mask for originial x
             post_mask = sdpa_mask(
                 bsz,
                 cache_position=position_ids.squeeze(0)[:cur_segment_len],
                 kv_length=cur_segment_len,
                 allow_is_causal_skip=False,
-                attention_mask=attention_mask[:, i*self.segment_len:(i+1)*self.segment_len]
+                attention_mask=origin_mask
             )
             # The sliding window alternating layers are not always activated depending on the config
             if self.attention_type == "sliding_attention":
@@ -337,6 +340,9 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
 
             hidden_states_list.append(concat_states[:, prefix_len:])
             debug_print(f"segment end: {torch.cuda.memory.memory_allocated()/1024/1024/1024}B")
+
+        # clear rope cache to avoid OOM
+        self.rotary_emb.cache = {}
 
         hidden_states = torch.cat(hidden_states_list, dim=1)
         # Residual in all blocks
@@ -389,7 +395,8 @@ class Qwen3RotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        if position_ids not in self.cache:
+        rope_cache_key = position_ids.shape[1]
+        if rope_cache_key not in self.cache:
             inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
             position_ids_expanded = position_ids[:, None, :].float()
 
@@ -399,9 +406,9 @@ class Qwen3RotaryEmbedding(nn.Module):
                 emb = torch.cat((freqs, freqs), dim=-1)
                 cos = emb.cos() * self.attention_scaling
                 sin = emb.sin() * self.attention_scaling
-            self.cache[position_ids] = (cos.to(dtype=x.dtype), sin.to(dtype=x.dtype))
+            self.cache[rope_cache_key] = (cos.to(dtype=x.dtype), sin.to(dtype=x.dtype))
 
-        return self.cache[position_ids]
+        return self.cache[rope_cache_key]
 
 
 @auto_docstring

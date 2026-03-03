@@ -16,6 +16,10 @@ else:
     associative_scan = None
 # associative_scan = None
 
+from xtuner.v1.utils import get_logger
+
+logger = get_logger()
+
 def debug_print(*args, **kwargs):
     if int(os.getenv("DEBUG", 0)):
         print(*args, **kwargs)
@@ -377,6 +381,8 @@ class BatchNeuralMemory(nn.Module):
 
         # Memory Module
         self.memory = Memory(config)
+        # for einsum_update
+        self._triu_cache = {}
 
         # Memory loss and grad function
         def forward_and_loss(params, inputs, target, loss_weights):
@@ -416,14 +422,15 @@ class BatchNeuralMemory(nn.Module):
         Update memory using for-loop (naive method)
         """
         bsz, num_chunks = surprise_update.shape[:2]
+        beta = 1.0 - alpha
         if len(past_memory_param.shape) == 3:
             eta = eta.unsqueeze(-1)
-            alpha = alpha.unsqueeze(-1)
+            beta = beta.unsqueeze(-1)
         for idx in range(num_chunks):
             # S_t = eta_t * S_{t-1} - theta_t * u_t
             past_surprise = past_surprise * eta[:, idx] - surprise_update[:, idx]
             # M_t = (1 - alpha_t) * M_{t-1} + S_t
-            past_memory_param = (1 - alpha[:, idx]) * past_memory_param + past_surprise
+            past_memory_param = beta[:, idx] * past_memory_param + past_surprise
         return past_memory_param, past_surprise
 
     def einsum_update(self, past_surprise, past_memory_param, surprise_update, eta, alpha):
@@ -433,36 +440,47 @@ class BatchNeuralMemory(nn.Module):
         M_t = beta_t * ... beta_1 * past_memory + \sum_{i = 1}^{t-1} beta_t * ... beta_{i+1} * S_i + S_t which beta_i = 1 - alpha_i
         """
         bsz, num_chunks = surprise_update.shape[:2]
+        device = eta.device
+
+        # Use cached triu masks if possible
+        triu_key = (bsz, num_chunks, device)
+        if triu_key not in self._triu_cache:
+            base_mask = torch.ones(bsz, num_chunks, num_chunks, device=device, dtype=torch.bool)
+            self._triu_cache[triu_key] = (
+                torch.triu(base_mask, diagonal=0),
+                torch.triu(base_mask, diagonal=1)
+            )
+        triu_mask_diag, triu_mask = self._triu_cache[triu_key]
+
+        # Build eta_matrix: cumulative product structure
         eta_matrix = eta.expand(bsz, num_chunks, num_chunks)
-        triu_mask_diag = torch.triu(torch.ones_like(eta_matrix, dtype=torch.bool), diagonal=0)
-        triu_mask = torch.triu(torch.ones_like(eta_matrix, dtype=torch.bool), diagonal=1)
         # 1,
         # eta_2, 1
         # ...
         # eta_t, eta_t, ..., 1
-        eta_matrix = eta_matrix.masked_fill(triu_mask_diag, 1)
+        eta_matrix = eta_matrix.masked_fill(triu_mask_diag, 1.0)
         eta_matrix = torch.cumprod(eta_matrix, dim=-2)
         # 1, 0, ...
         # eta_2, 1
         # ...
         # eta_2*...*eta_t, eta_3*...*eta_t, ..., 1
-        eta_matrix = eta_matrix.masked_fill(triu_mask, 0)
+        eta_matrix = eta_matrix.masked_fill(triu_mask, 0.0)
         # eta_1*S0, ..., eta_1*...*eta_t*S0
-        past_surprise_matrix = torch.einsum(f"bmn,b...->bm...", torch.cumprod(eta, dim=-2), past_surprise)
+        eta_cumprod = torch.cumprod(eta, dim=-2)  # [bsz, num_chunks, 1]
+        past_surprise_matrix = torch.einsum(f"bm,b...->bm...", eta_cumprod.squeeze(-1), past_surprise)
         # \sum_{i=1}^{t-1} eta_t * ... eta_{i+1} * theta_{i} * u_{i} + theta_{t} * u_{t}
         surprise_matrix = torch.einsum(f"bmn,bn...->bm...", eta_matrix, surprise_update)
         surprise_matrix = past_surprise_matrix - surprise_matrix
 
-        beta = 1 - alpha
+        beta = 1.0 - alpha
         # beta_1*...*beta_t*M_{0}
         if len(past_memory_param.shape) == 3:
-            past_memory_matrix = past_memory_param * torch.cumprod(beta, dim=-2)[:, -1:]
+            beta_cumprod = torch.cumprod(beta, dim=-2)[:, -1:]  # [bsz, 1, 1]
         else:
-            # norm
-            past_memory_matrix = past_memory_param * torch.cumprod(beta, dim=-2)[:, -1]
+            beta_cumprod = torch.cumprod(beta, dim=-2)[:, -1]  # [bsz, 1]
+        past_memory_matrix = past_memory_param * beta_cumprod
         # beta_2*...*beta_t, beta_3*...*beta_t, ..., beta_t
-        beta_cumprod = torch.cumprod(beta[:, 1:, 0].flip(dims=[1]), dim=-1)
-        beta_cumprod = beta_cumprod.flip(dims=[1])
+        beta_cumprod = torch.cumprod(beta[:, 1:, 0].flip(dims=[1]), dim=-1).flip(dims=[1])
         # \sum_{i = 1}^{t-1} beta_t * ... beta_{i+1} * S_i + S_t
         memory_matrix = torch.einsum(f"bm,bm...->b...", beta_cumprod, surprise_matrix[:, :-1])
         memory_param = past_memory_matrix + memory_matrix + surprise_matrix[:, -1]
@@ -542,7 +560,28 @@ class BatchNeuralMemory(nn.Module):
 
         new_memory_params, new_suprises = {}, {}
 
-        for param_name, surprise_update in grads.items():
+        # # get grad clip coef:
+        # with torch.no_grad():
+        #     norms = []
+        #     for param_name, surprise_update in grads.items():
+        #         # B,
+        #         grad_norm = torch.norm(surprise_update, p=2, dim=surprise_update.shape[1:])
+        #         norms.append(grad_norm)
+        #         logger.info(f"Grad Norm of {param_name}: {grad_norm}")
+        #     # B, 3
+        #     norms = torch.stack(norms, dim=1)
+        #     total_norm = torch.norm(norms, p=2, dim=1)
+        #     clip_coef = 1.0 / (total_norm + 1e-6)
+        #     clip_coef = torch.clamp(clip_coef, max=1.0).reshape(bsz, 1, 11, ).to(x.device)
+            
+
+        # for param_name, surprise_update in grads.items():
+        for param_name in grads.keys():
+            surprise_update = grads[param_name]
+            # # clip
+            # logger.info(f"Before clip {param_name}: {surprise_update} | coef: {clip_coef}")
+            # surprise_update.mul_(clip_coef)
+            # logger.info(f"After clip {param_name}: {surprise_update}")
             if param_name not in past_surprises:
                 # First token's surprise init as 0 TODO
                 past_surprises[param_name] = torch.zeros(bsz, *surprise_update.shape[2:], device=surprise_update.device, dtype=surprise_update.dtype)

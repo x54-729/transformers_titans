@@ -394,7 +394,8 @@ class BatchNeuralMemory(nn.Module):
             return loss
 
         # 对每个样本计算梯度
-        self.per_sample_grad_fn = vmap(vmap(grad(forward_and_loss), in_dims=(None, 0, 0, 0)), in_dims=(0, 0, 0, 0))
+        self.per_sample_grad_fn = vmap(grad(forward_and_loss), in_dims=(0, 0, 0, 0))
+        # self.per_sample_grad_fn = vmap(grad(forward_and_loss), in_dims=(0, 0, 0, None))
 
         def retrieve_fn(params, inputs):
             pred = functional_call(self.memory, params, inputs)
@@ -417,102 +418,6 @@ class BatchNeuralMemory(nn.Module):
 
         return output, memory_params, past_surprises
 
-    def naive_update(self, past_surprise, past_memory_param, surprise_update, eta, alpha):
-        """
-        Update memory using for-loop (naive method)
-        """
-        bsz, num_chunks = surprise_update.shape[:2]
-        beta = 1.0 - alpha
-        if len(past_memory_param.shape) == 3:
-            eta = eta.unsqueeze(-1)
-            beta = beta.unsqueeze(-1)
-        for idx in range(num_chunks):
-            # S_t = eta_t * S_{t-1} - theta_t * u_t
-            past_surprise = past_surprise * eta[:, idx] - surprise_update[:, idx]
-            # M_t = (1 - alpha_t) * M_{t-1} + S_t
-            past_memory_param = beta[:, idx] * past_memory_param + past_surprise
-        return past_memory_param, past_surprise
-
-    def einsum_update(self, past_surprise, past_memory_param, surprise_update, eta, alpha):
-        """
-        Update memory with batch matmul
-        S_t = eta_t * ... eta_1 * past_surprise - \sum_{i=1}^{t-1} eta_t * ... eta_{i+1} * theta_{i} * u_{i} - theta_{t} * u_{t}
-        M_t = beta_t * ... beta_1 * past_memory + \sum_{i = 1}^{t-1} beta_t * ... beta_{i+1} * S_i + S_t which beta_i = 1 - alpha_i
-        """
-        bsz, num_chunks = surprise_update.shape[:2]
-        device = eta.device
-
-        # Use cached triu masks if possible
-        triu_key = (bsz, num_chunks, device)
-        if triu_key not in self._triu_cache:
-            base_mask = torch.ones(bsz, num_chunks, num_chunks, device=device, dtype=torch.bool)
-            self._triu_cache[triu_key] = (
-                torch.triu(base_mask, diagonal=0),
-                torch.triu(base_mask, diagonal=1)
-            )
-        triu_mask_diag, triu_mask = self._triu_cache[triu_key]
-
-        # Build eta_matrix: cumulative product structure
-        eta_matrix = eta.expand(bsz, num_chunks, num_chunks)
-        # 1,
-        # eta_2, 1
-        # ...
-        # eta_t, eta_t, ..., 1
-        eta_matrix = eta_matrix.masked_fill(triu_mask_diag, 1.0)
-        eta_matrix = torch.cumprod(eta_matrix, dim=-2)
-        # 1, 0, ...
-        # eta_2, 1
-        # ...
-        # eta_2*...*eta_t, eta_3*...*eta_t, ..., 1
-        eta_matrix = eta_matrix.masked_fill(triu_mask, 0.0)
-        # eta_1*S0, ..., eta_1*...*eta_t*S0
-        eta_cumprod = torch.cumprod(eta, dim=-2)  # [bsz, num_chunks, 1]
-        past_surprise_matrix = torch.einsum(f"bm,b...->bm...", eta_cumprod.squeeze(-1), past_surprise)
-        # \sum_{i=1}^{t-1} eta_t * ... eta_{i+1} * theta_{i} * u_{i} + theta_{t} * u_{t}
-        surprise_matrix = torch.einsum(f"bmn,bn...->bm...", eta_matrix, surprise_update)
-        surprise_matrix = past_surprise_matrix - surprise_matrix
-
-        beta = 1.0 - alpha
-        # beta_1*...*beta_t*M_{0}
-        if len(past_memory_param.shape) == 3:
-            beta_cumprod = torch.cumprod(beta, dim=-2)[:, -1:]  # [bsz, 1, 1]
-        else:
-            beta_cumprod = torch.cumprod(beta, dim=-2)[:, -1]  # [bsz, 1]
-        past_memory_matrix = past_memory_param * beta_cumprod
-        # beta_2*...*beta_t, beta_3*...*beta_t, ..., beta_t
-        beta_cumprod = torch.cumprod(beta[:, 1:, 0].flip(dims=[1]), dim=-1).flip(dims=[1])
-        # \sum_{i = 1}^{t-1} beta_t * ... beta_{i+1} * S_i + S_t
-        memory_matrix = torch.einsum(f"bm,bm...->b...", beta_cumprod, surprise_matrix[:, :-1])
-        memory_param = past_memory_matrix + memory_matrix + surprise_matrix[:, -1]
-
-        return memory_param, surprise_matrix[:, -1]
-
-    def assocscan_update(self, past_surprise, past_memory_param, surprise_update, eta, alpha):
-        """
-        Update memory with associative scan
-        """
-        bsz, num_chunks = surprise_update.shape[:2]
-        if len(past_memory_param.shape) == 3:
-            eta = eta.unsqueeze(-1)
-            alpha = alpha.unsqueeze(-1)
-            ones_shape = (1, 1)
-        else:
-            ones_shape = (1, )
-        # S0, -u1, -u2, -u3, ..., -ut
-        surprise_update = torch.cat([past_surprise.unsqueeze(1), -surprise_update], dim=1)
-        # 1, eta1, eta2, eta3, ..., eta4
-        eta = torch.cat([torch.ones(bsz, 1, *ones_shape, device=eta.device, dtype=eta.dtype), eta], dim=1)
-        # S0, S1, S2, ...., St
-        _, surprise = self.assocscan_fn(binary_operator, (eta, surprise_update), dim=1, combine_mode="generic")
-
-        # M0, S1, S2, S3
-        memory_param = torch.cat([past_memory_param.unsqueeze(1), surprise[:, 1:]], dim=1)
-        # 1, 1-alpha1, ..., 1-alphat
-        beta = torch.cat([torch.ones(bsz, 1, *ones_shape, device=alpha.device, dtype=alpha.dtype), 1-alpha], dim=1)
-        _, memory_param = self.assocscan_fn(binary_operator, (beta, memory_param), dim=1, combine_mode="generic")
-
-        return memory_param[:, -1], surprise[:, -1]
-
     def store(self, x, memory_params, past_surprises=None):
         """
         Upate Memory Weights with theta_k, theta_v chunk by chunk
@@ -531,7 +436,7 @@ class BatchNeuralMemory(nn.Module):
         if pad_seq_len > seq_len:
             # pad to full
             # TODO pad token id
-            x = F.pad(x, (0, 0, 0, pad_seq_len-seq_len), value=self.config.pad_token_id)
+            x = F.pad(x, (0, 0, 0, pad_seq_len-seq_len), value=0)
 
         # B, N, C, D
         x = x.view(bsz, num_chunks, self.chunk_size, hidden_size).contiguous()
@@ -543,6 +448,10 @@ class BatchNeuralMemory(nn.Module):
         alpha = self.alpha(x_c).sigmoid()
         theta = self.theta(x_c).sigmoid() * self.base_lr
         eta = self.eta(x_c).sigmoid()
+        # alpha = 0.1
+        # theta = 0.05
+        # eta = 0.5
+        beta = 1.0 - alpha
 
         # k_t with act and l2 norm
         k_proj = self.wk(x)
@@ -552,61 +461,41 @@ class BatchNeuralMemory(nn.Module):
         v_proj = self.wv(x)
         v_proj = self.qkv_act_fn(v_proj)
 
-        # Per sample Per token memory grad
-        # grads: dict, value shape: bsz, num_chunks, inter_dim, hidden_size
-        debug_print(f"before grad {torch.cuda.memory.memory_allocated()/1024/1024/1024}B")
-        grads = self.per_sample_grad_fn(memory_params, k_proj, v_proj, theta)
-        debug_print(f"after grad {torch.cuda.memory.memory_allocated()/1024/1024/1024}B")
+        for chunk_idx in range(num_chunks):
 
-        new_memory_params, new_suprises = {}, {}
+            # Per sample Per token memory grad
+            # grads: dict, value shape: bsz, inter_dim, hidden_size
+            grads = self.per_sample_grad_fn(memory_params, k_proj[:, chunk_idx], v_proj[:, chunk_idx], theta[:, chunk_idx])
+            # grads = self.per_sample_grad_fn(memory_params, k_proj[:, chunk_idx], v_proj[:, chunk_idx], theta)
 
-        # # get grad clip coef:
-        # with torch.no_grad():
-        #     norms = []
-        #     for param_name, surprise_update in grads.items():
-        #         # B,
-        #         grad_norm = torch.norm(surprise_update, p=2, dim=surprise_update.shape[1:])
-        #         norms.append(grad_norm)
-        #         logger.info(f"Grad Norm of {param_name}: {grad_norm}")
-        #     # B, 3
-        #     norms = torch.stack(norms, dim=1)
-        #     total_norm = torch.norm(norms, p=2, dim=1)
-        #     clip_coef = 1.0 / (total_norm + 1e-6)
-        #     clip_coef = torch.clamp(clip_coef, max=1.0).reshape(bsz, 1, 11, ).to(x.device)
-            
+            # for param_name, surprise_update in grads.items():
+            new_memory_params, new_surprises = {}, {}
+            for param_name in grads.keys():
+                surprise_update = grads[param_name]
+                if param_name not in past_surprises:
+                    # First token's surprise init as 0 TODO
+                    past_surprises[param_name] = torch.zeros(bsz, *surprise_update.shape[1:], device=surprise_update.device, dtype=surprise_update.dtype)
+                past_surprise = past_surprises[param_name]
+                past_memory_param = memory_params[param_name]
 
-        # for param_name, surprise_update in grads.items():
-        for param_name in grads.keys():
-            surprise_update = grads[param_name]
-            # # clip
-            # logger.info(f"Before clip {param_name}: {surprise_update} | coef: {clip_coef}")
-            # surprise_update.mul_(clip_coef)
-            # logger.info(f"After clip {param_name}: {surprise_update}")
-            if param_name not in past_surprises:
-                # First token's surprise init as 0 TODO
-                past_surprises[param_name] = torch.zeros(bsz, *surprise_update.shape[2:], device=surprise_update.device, dtype=surprise_update.dtype)
-            past_surprise = past_surprises[param_name]
-            past_memory_param = memory_params[param_name]
-            debug_print(f"before update {param_name}: {torch.cuda.memory.memory_allocated()/1024/1024/1024}B")
+                if len(surprise_update.shape) == 3:
+                    past_surprise = eta[:, chunk_idx].unsqueeze(-1) * past_surprise - surprise_update
+                    memory_param = beta[:, chunk_idx].unsqueeze(-1) * past_memory_param + past_surprise
+                else:
+                    past_surprise = eta[:, chunk_idx] * past_surprise - surprise_update
+                    memory_param = beta[:, chunk_idx] * past_memory_param + past_surprise
+                # breakpoint()
 
-            if self.update_method == "naive":
-                # update memory using for-loop (naive method)
-                memory_param, surprise = self.naive_update(past_surprise, past_memory_param, surprise_update, eta, alpha)
-            elif self.update_method == "einsum":
-                # update memory using einsum
-                memory_param, surprise = self.einsum_update(past_surprise, past_memory_param, surprise_update, eta, alpha)
-            elif self.update_method == "assocscan":
-                # update memory using associative scane
-                memory_param, surprise = self.assocscan_update(past_surprise, past_memory_param, surprise_update, eta, alpha)
-            else:
-                raise NotImplementedError(f"Not Implemented: {self.update_method}")
-            new_memory_params[param_name] = memory_param
-            new_suprises[param_name] = surprise
-            debug_print(f"after update {param_name}: {torch.cuda.memory.memory_allocated()/1024/1024/1024}B")
+                # past_surprise = eta * past_surprise - surprise_update
+                # memory_param = beta * past_memory_param + past_surprise
 
-        debug_print(f"store end: {torch.cuda.memory.memory_allocated()/1024/1024/1024}B")
+                new_memory_params[param_name] = memory_param
+                new_surprises[param_name] = past_surprise
 
-        return new_memory_params, new_suprises
+            memory_params = new_memory_params
+            past_surprises = new_surprises
+        # breakpoint()
+        return memory_params, past_surprises
 
     def retrieve(self, x, memory_params):
         """

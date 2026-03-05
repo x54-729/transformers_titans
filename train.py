@@ -138,28 +138,32 @@ def load_dataloader(dataloader, save_path):
     return dataloader
 
 def find_latest_ckpt(work_dir):
-    if not os.path.exists(latest_info_path):
+    if not config.RESUME:
+        return False
+    if isinstance(config.RESUME, str):
+        return config.RESUME
+    elif not os.path.exists(latest_info_path):
         return False
     else:
         with open(latest_info_path) as fp:
             latest_info = json.load(fp)
-        return latest_info
+        return latest_info["path"]
 
 def resume_model(work_dir, model_class, model_config, tokenizer_path):
-    latest_info = find_latest_ckpt(work_dir)
-    if not latest_info:
+    latest_path = find_latest_ckpt(work_dir)
+    if not latest_path:
         model_dir = os.path.join(work_dir, "init_model")
+        # TODO
         if not os.path.exists(model_dir) and RANK == 0:
             model = model_class(model_config)
             model.save_pretrained(model_dir)
             del model
     else:
-        resume_dir = latest_info["path"]
-        logger.info(f"Resume model from {resume_dir}")
-        model_dir = os.path.join(resume_dir, "model")
+        logger.info(f"Resume model from {latest_path}")
+        model_dir = os.path.join(latest_path, "model")
         tokenizer_path = model_dir
     dist.barrier()
-    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=model_config.torch_dtype, trust_remote_code=True).cuda()
+    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=model_config.torch_dtype, trust_remote_code=True, attn_implementation="eager").cuda()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     model.train()
 
@@ -171,14 +175,13 @@ def resume_model(work_dir, model_class, model_config, tokenizer_path):
     
 
 def resume_states(work_dir, optimizer, scheduler, dataloader):
-    latest_info = find_latest_ckpt(work_dir)
-    if not latest_info:
+    latest_path = find_latest_ckpt(work_dir)
+    if not latest_path:
         cur_step = 0
         consumed_samples = 0
         consumed_tokens = 0
     else:
-        resume_dir = latest_info["path"]
-        states_dir = os.path.join(resume_dir, "states")
+        states_dir = os.path.join(latest_path, "states")
 
         optimizer_path = os.path.join(states_dir, "optimizer", f"rank{RANK}")
         logger.info(f"Resume optimizer from {optimizer_path}")
@@ -357,7 +360,23 @@ while cur_step < config.TOTAL_STEPS:
 
     loss.backward()
 
+    if getattr(config, "DEBUG", False):
+        per_grad_norm_before = {}
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            per_grad_norm_before[name] = torch.norm(param.grad).item()
+            # if torch.isnan(param.grad).any().item():
+            #     print(name)
+
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.MAX_GRAD_NORM)
+
+    if getattr(config, "DEBUG", False):
+        per_grad_norm_after = {}
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            per_grad_norm_after[name] = torch.norm(param.grad).item()
 
     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
         logger.info(f"Gradient norm {grad_norm} is invalid, skipping optimizer step.")
@@ -408,6 +427,12 @@ while cur_step < config.TOTAL_STEPS:
         "speed/total_time": total_time,
         "speed/tgs": tgs,
     }
+
+    if getattr(config, "DEBUG", False):
+        for name, grad_norm in per_grad_norm_before.items():
+            log_scalars[f"grad_norm_before/{name}"] = grad_norm
+        for name, grad_norm in per_grad_norm_after.items():
+            log_scalars[f"grad_norm_after/{name}"] = grad_norm
     exp_tracker.add_scalars(tag_scalar_dict=log_scalars, global_step=cur_step)
 
     if cur_step % config.SAVE_FREQ == 0 or cur_step == config.TOTAL_STEPS -1:
@@ -422,18 +447,10 @@ while cur_step < config.TOTAL_STEPS:
         if RANK == 0 and os.path.exists(savedir_legacy):
             shutil.rmtree(savedir_legacy)
 
-
-
-    try:
-        for k, v in model.module.model.layers[0].neural_memory.memory.named_parameters():
-            if len(v.shape) == 2:
-                logger.info(f"------------{k}------------\n{v}\n{v[0][0].item()}\n------------------------")
-            else:
-                logger.info(f"------------{k}------------\n{v}\n{v[0].item()}\n------------------------")
-    except:
-        pass
+    # breakpoint()
 
     if cur_step % 50 == 0:
+        torch.cuda.empty_cache()
         gc.collect()
 
 logger.info(f"Training Finished. Time Cost: {time.time() - start_time}s")

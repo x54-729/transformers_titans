@@ -244,6 +244,7 @@ class Qwen3MACConfig(PretrainedConfig):
             "bias": False,
             "update_method": "naive",
             "off_load": False,
+            "max_grad_norm": 1.0,
             # persistent memory
             "num_persist_mem": 4,
             # others

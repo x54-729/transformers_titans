@@ -19,6 +19,12 @@ from torch.utils._foreach_utils import (
     _device_has_foreach_support,
     _has_foreach_support,
 )
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+    offload_wrapper,
+)
 
 from xtuner.v1.utils.grad_norm import cal_total_norm
 from xtuner.v1.utils import get_logger, Config
@@ -167,9 +173,28 @@ def resume_model(work_dir, model_class, model_config, tokenizer_path):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     model.train()
 
-    model.gradient_checkpointing_enable()
+    if config.IS_MEMORY_WARMUP:
+        gradient_checkpointing_kwargs = {"use_reentrant": False}
+        find_unused_parameters = True
+    else:
+        gradient_checkpointing_kwargs = {"use_reentrant": True}
+        find_unused_parameters = False
+
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
     logger.info(f"Total Params: {sum([p.numel() for p in model.parameters()])/1024/1024/1024}B")
-    model = DDP(model, device_mesh=data_mesh)
+
+    # for name, param in model.named_parameters():
+    #     if "neural_memory" not in name and "lm_head" not in name and "embed_tokens" not in name:
+    #         param.requires_grad = False
+
+    # def backward_hook(module, grad_input, grad_output):
+    #     print("========================================================================================")
+    #     print(grad_input[0], torch.isnan(grad_input[0]).any(), torch.isinf(grad_input[0]).any(), grad_input[0].abs().max())
+    #     print(grad_output[0], torch.isnan(grad_output[0]).any(), torch.isinf(grad_output[0]).any(), grad_output[0].abs().max())
+    
+    # model.model.layers[8].neural_memory.memory.layer_norm.register_backward_hook(backward_hook)
+
+    model = DDP(model, device_mesh=data_mesh, find_unused_parameters=find_unused_parameters)
 
     return model, tokenizer
     
@@ -183,10 +208,11 @@ def resume_states(work_dir, optimizer, scheduler, dataloader):
     else:
         states_dir = os.path.join(latest_path, "states")
 
-        optimizer_path = os.path.join(states_dir, "optimizer", f"rank{RANK}")
-        logger.info(f"Resume optimizer from {optimizer_path}")
-        optimizer_states = torch.load(optimizer_path)
-        optimizer.load_state_dict(optimizer_states)
+        if not config.get("SKIP_OPTIMIZER", False):
+            optimizer_path = os.path.join(states_dir, "optimizer", f"rank{RANK}")
+            logger.info(f"Resume optimizer from {optimizer_path}")
+            optimizer_states = torch.load(optimizer_path)
+            optimizer.load_state_dict(optimizer_states)
 
         scheduler_path = os.path.join(states_dir, "scheduler")
         logger.info(f"Resume scheduler from {scheduler_path}")
@@ -255,6 +281,9 @@ args = parser.parse_args()
 
 config = Config.fromfile(args.config)
 
+config.MEMORY_WARMUP = config.get("MEMORY_WARMUP", 0)
+config.IS_MEMORY_WARMUP = config.get("IS_MEMORY_WARMUP", False)
+
 monkey_patch_hf_modules_cache()
 
 if not dist.is_initialized():
@@ -278,6 +307,7 @@ logger.info(config.pretty_text)
 logger.info(f"==========================================")
 
 model, tokenizer = resume_model(config.WORK_DIR, config.model_class, config.model_config, config.TOKENIZER_PATH)
+# breakpoint()
 
 dataloader_cfg = InternDataloaderConfig(
     config_path=config.INTERNLM_CFG,
@@ -296,7 +326,7 @@ dataloader = dataloader_cfg.build(
     total_step=config.TOTAL_STEPS,
 )
 
-optimizer = optim.AdamW(model.parameters(), lr=config.LR, weight_decay=config.WEIGHT_DECAY)
+optimizer = optim.AdamW([(n, p) for n, p in model.named_parameters() if p.requires_grad], lr=config.LR, weight_decay=config.WEIGHT_DECAY)
 def warmup_fn(x):
     return x / config.WARMUP if x < config.WARMUP else 1
 
@@ -310,13 +340,14 @@ lr_scheduler = SequentialLR(
 optimizer, lr_scheduler, dataloader, cur_step, consumed_samples, consumed_tokens = resume_states(config.WORK_DIR, optimizer, lr_scheduler, dataloader)
 
 # check grad norm
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 
 ######################## Training ##################
 data_iter = iter(dataloader)
 
 log_dir = os.path.join(config.WORK_DIR, "tensorboard", f"rank{RANK}")
 exp_tracker = get_writer(writer_type="tensorboard", log_dir=log_dir)
+nan_inf_flag = False
 
 start_time = time.time()
 while cur_step < config.TOTAL_STEPS:
@@ -347,16 +378,21 @@ while cur_step < config.TOTAL_STEPS:
     shifted_labels = torch.cat(shifted_labels, dim=0)[:, :cur_max_len]
     attention_mask = torch.cat(attention_mask, dim=0)[:, :cur_max_len]
 
-    output = model(input_ids, attention_mask=attention_mask)
+    update_memory = (cur_step + 1) >= config.MEMORY_WARMUP
+
+    output_tuple = model(input_ids, attention_mask=attention_mask, update_memory=update_memory)
+    if isinstance(output_tuple, tuple):
+        output, aux_list = output_tuple
+    else:
+        output, aux_list = output_tuple, None
     logits = output.logits.float()
     logits = logits.reshape(-1, logits.size(-1))  # (bs * seq_len, vocab_size)
     shifted_labels = shifted_labels.flatten()
     loss = F.cross_entropy(logits, shifted_labels, ignore_index=-100)
 
     if dist.is_initialized():
-        loss = all_reduce(loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD) / WORLD_SIZE
-
-    reduced_loss = loss.detach().item()
+        reduced_loss = all_reduce(loss.detach(), op=dist.ReduceOp.SUM, group=dist.group.WORLD) / WORLD_SIZE
+        reduced_loss = reduced_loss.detach().item()
 
     loss.backward()
 
@@ -366,8 +402,12 @@ while cur_step < config.TOTAL_STEPS:
             if param.grad is None:
                 continue
             per_grad_norm_before[name] = torch.norm(param.grad).item()
-            # if torch.isnan(param.grad).any().item():
-            #     print(name)
+            if torch.isnan(param.grad).any().item():
+                logger.info("nan:", name)
+                nan_inf_flag = True
+            if torch.isinf(param.grad).any().item():
+                logger.info("inf:", name)
+                nan_inf_flag = True
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.MAX_GRAD_NORM)
 
@@ -433,9 +473,16 @@ while cur_step < config.TOTAL_STEPS:
             log_scalars[f"grad_norm_before/{name}"] = grad_norm
         for name, grad_norm in per_grad_norm_after.items():
             log_scalars[f"grad_norm_after/{name}"] = grad_norm
+
+    if aux_list is not None:
+        for layer_idx, aux in enumerate(aux_list):
+            loss_list, grad_norm_dict = aux
+            log_scalars[f"inner_loss/layer_{layer_idx}"] = sum(loss_list) / len(loss_list)
+            for name, value in grad_norm_dict.items():
+                log_scalars[f"{name}_grad_norm/layer_{layer_idx}"] = sum(value) / len(value)
     exp_tracker.add_scalars(tag_scalar_dict=log_scalars, global_step=cur_step)
 
-    if cur_step % config.SAVE_FREQ == 0 or cur_step == config.TOTAL_STEPS -1:
+    if cur_step % config.SAVE_FREQ == 0 or cur_step == config.TOTAL_STEPS:
         save_dir = os.path.join(os.path.join(config.WORK_DIR, f"step-{cur_step}"))
         save_model_and_states(save_dir, cur_step, consumed_tokens, consumed_samples, model, optimizer, lr_scheduler, dataloader)
     elif cur_step % config.SNAPSHOT == 0:
@@ -447,7 +494,9 @@ while cur_step < config.TOTAL_STEPS:
         if RANK == 0 and os.path.exists(savedir_legacy):
             shutil.rmtree(savedir_legacy)
 
-    # breakpoint()
+    if nan_inf_flag:
+        logger.info("Nan or Inf in grad, exit.")
+        break
 
     if cur_step % 50 == 0:
         torch.cuda.empty_cache()

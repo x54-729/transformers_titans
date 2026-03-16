@@ -19,7 +19,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Callable, Optional, Union
 
 import torch
@@ -29,7 +28,7 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask, sdpa_mask
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
     GenericForQuestionAnswering,
@@ -44,9 +43,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
-from .configuration_qwen3 import Qwen3MACConfig
-# from .neural_memory import BatchNeuralMemory, BatchNeuralMemoryV2, BatchNeuralMemoryV3, BatchNeuralMemoryV4, NeuralMemory, debug_print
-from .neural_memory import BatchNeuralMemoryV3, debug_print
+from .configuration_qwen3 import Qwen3Config
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -161,7 +158,7 @@ def eager_attention_forward(
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3MACConfig, layer_idx: int):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -170,6 +167,7 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.qk_norm = config.qk_norm
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -183,8 +181,9 @@ class Qwen3Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        if self.qk_norm:
+            self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+            self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -199,13 +198,15 @@ class Qwen3Attention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        if self.qk_norm:
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        else:
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        # TODO
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
@@ -231,34 +232,22 @@ class Qwen3Attention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output
+        return attn_output, attn_weights
 
 
-class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
-    """
-    Qwen3 Decoder Layer with MAC
-    """
-    def __init__(self, config: Qwen3MACConfig, layer_idx: int):
+class Qwen3DecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
+
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
-        # self.mlp = Qwen3MLP(config)
-        # self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.mlp = Qwen3MLP(config)
+        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
-        # Titans
-        # self.neural_memory = BatchNeuralMemory(config)
-        self.neural_memory = BatchNeuralMemoryV3(config)
-        self.num_persist_mem = config.titans["num_persist_mem"]
-        if self.num_persist_mem > 0:
-            self.persist_mem = nn.Parameter(torch.randn(1, self.num_persist_mem, self.hidden_size) * 0.02)
-        self.gate = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.output_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.segment_len = config.titans["segment_len"]
-
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -270,114 +259,35 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        bsz, seq_len, _ = hidden_states.shape
-        # cut into segments
-        num_segments = math.ceil(seq_len / self.segment_len)
-        hidden_states_list = []
         residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
 
-        # hidden_states = self.input_layernorm(hidden_states)
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
 
-        if self.num_persist_mem > 0:
-            persist_mem = self.persist_mem.expand(bsz, -1, -1)
-        if isinstance(self.neural_memory, (BatchNeuralMemory, NeuralMemory)):
-            memory_params = self.neural_memory.get_memory_params(bsz)
-        elif  isinstance(self.neural_memory, (BatchNeuralMemoryV2, BatchNeuralMemoryV3, BatchNeuralMemoryV4)):
-            memory_params = self.neural_memory.get_memory_params()
-        else:
-            raise NotImplementedError(type(self.neural_memory))
-        surprises = None
-        loss_list, grad_norm_dict = [], {}
-        for i in range(num_segments):
-            debug_print(f"======== segment {i} {torch.cuda.memory.memory_allocated()/1024/1024/1024}B ======")
-            # TODO: chunk segment at main model?
-            # create position embeddings to be shared across the decoder layers
-            cur_hidden_states = hidden_states[:, i*self.segment_len:(i+1)*self.segment_len, :]
-            cur_segment_len = cur_hidden_states.shape[1]
-            prefix_len = cur_segment_len + self.num_persist_mem
-            full_len = prefix_len + cur_segment_len
-
-            # bsz, seq_len with True and False
-            if attention_mask is not None:
-                assert len(attention_mask.shape) == 2, attention_mask.shape
-                origin_mask = attention_mask[:, i*self.segment_len:(i+1)*self.segment_len]
-                pre_mask = torch.ones(bsz, prefix_len, device=origin_mask.device, dtype=origin_mask.dtype)
-                memory_mask = torch.cat([pre_mask, origin_mask], dim=1)
-            else:
-                memory_mask, origin_mask = None, None
-
-            retrieved_memory = self.neural_memory.retrieve(cur_hidden_states, memory_params, mask=origin_mask)
-            if self.num_persist_mem > 0:
-                concat_states = torch.cat([persist_mem, retrieved_memory, cur_hidden_states], dim=1)
-            else:
-                concat_states = torch.cat([retrieved_memory, cur_hidden_states], dim=1)
-
-            position_ids = torch.arange(
-                0, full_len, device=concat_states.device
-            ).unsqueeze(0)
-            position_embeddings = self.rotary_emb(concat_states, position_ids)
-
-            # causal mask for originial x
-            post_mask = sdpa_mask(
-                bsz,
-                cache_position=position_ids.squeeze(0)[:cur_segment_len],
-                kv_length=cur_segment_len,
-                allow_is_causal_skip=False,
-                attention_mask=origin_mask
-            )
-            # The sliding window alternating layers are not always activated depending on the config
-            if self.attention_type == "sliding_attention":
-                raise NotImplementedError
-
-            cur_attention_mask = torch.zeros(bsz, 1, full_len, full_len, dtype=post_mask.dtype, device=post_mask.device)
-            # mask for persist mem & memory, all available
-            cur_attention_mask[:, :, :, :prefix_len] = True
-            cur_attention_mask[:, :, prefix_len:, prefix_len:] = post_mask
-            if self.config._attn_implementation == "eager":
-                min_dtype = torch.finfo(torch.float32).min
-                cur_attention_mask = torch.where(cur_attention_mask, torch.tensor(0.0, device=cur_attention_mask.device, dtype=torch.float32), min_dtype)
-
-            concat_states = self.self_attn(
-                hidden_states=concat_states,
-                attention_mask=cur_attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-            # concat_states = self.post_attention_layernorm(concat_states)
-
-            latest_memory, memory_params, surprises, aux = self.neural_memory(concat_states, memory_params, surprises, mask=memory_mask)
-
-            loss_list.extend(aux[0])
-            for name, value in aux[1].items():
-                if name not in grad_norm_dict:
-                    grad_norm_dict[name] = []
-                grad_norm_dict[name].extend(value)
-
-            # gate before output TODO
-            concat_states = self.gate(self.output_layernorm(latest_memory * concat_states))
-
-            hidden_states_list.append(concat_states[:, prefix_len:])
-
-        # clear rope cache to avoid OOM
-        self.rotary_emb.cache = {}
-
-        hidden_states = torch.cat(hidden_states_list, dim=1)
-        # Residual in all blocks
-        hidden_states = hidden_states + residual
-
-        return hidden_states, (loss_list, grad_norm_dict)
 
 @auto_docstring
-class Qwen3MACPreTrainedModel(PreTrainedModel):
-    config: Qwen3MACConfig
+class Qwen3PreTrainedModel(PreTrainedModel):
+    config: Qwen3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3MACDecoderLayer"]
+    _no_split_modules = ["Qwen3DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -386,7 +296,7 @@ class Qwen3MACPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": Qwen3MACDecoderLayer,
+        "hidden_states": Qwen3DecoderLayer,
         "attentions": Qwen3Attention,
     }
 
@@ -394,7 +304,7 @@ class Qwen3MACPreTrainedModel(PreTrainedModel):
 class Qwen3RotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: Qwen3MACConfig, device=None):
+    def __init__(self, config: Qwen3Config, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
@@ -411,40 +321,36 @@ class Qwen3RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
-        self.cache = {}
-
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        rope_cache_key = position_ids.shape[1]
-        if rope_cache_key not in self.cache:
-            inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-            position_ids_expanded = position_ids[:, None, :].float()
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
 
-            device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-            with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-                freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-                emb = torch.cat((freqs, freqs), dim=-1)
-                cos = emb.cos() * self.attention_scaling
-                sin = emb.sin() * self.attention_scaling
-            self.cache[rope_cache_key] = (cos.to(dtype=x.dtype), sin.to(dtype=x.dtype))
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
 
-        return self.cache[rope_cache_key]
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 @auto_docstring
-class Qwen3MACModel(Qwen3MACPreTrainedModel):
+class Qwen3Model(Qwen3PreTrainedModel):
     _auto_class = "AutoModel"
-    def __init__(self, config: Qwen3MACConfig):
+    def __init__(self, config: Qwen3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Qwen3MACDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
@@ -482,31 +388,51 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        # It may already have been prepared by e.g. `generate`
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            # Create the masks
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+            }
+            # The sliding window alternating layers are not always activated depending on the config
+            if self.has_sliding_layers:
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
         hidden_states = inputs_embeds
 
-        aux_list = []
-        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            debug_print(f"------------------- layer {i} {torch.cuda.memory.memory_allocated()/1024/1024/1024}B---------------------")
-            hidden_states, aux = decoder_layer(
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
-            aux_list.append(aux)
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
-        ), aux_list
+        )
 
 
 @auto_docstring
-class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
+class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _auto_class = "AutoModelForCausalLM"
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -514,7 +440,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3MACModel(config)
+        self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -558,7 +484,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        outputs, aux_list = self.model(
+        outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -584,26 +510,26 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-        ), aux_list
+        )
 
 
-class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3MACPreTrainedModel):
+class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
     pass
 
 
-class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3MACPreTrainedModel):
+class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrainedModel):
     pass
 
 
-class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3MACPreTrainedModel):
+class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
     base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
 
 
 __all__ = [
-    "Qwen3MACForCausalLM",
-    # "Qwen3ForQuestionAnswering",
-    "Qwen3MACPreTrainedModel",
-    "Qwen3MACModel",
-    # "Qwen3ForSequenceClassification",
-    # "Qwen3ForTokenClassification",
+    "Qwen3ForCausalLM",
+    "Qwen3ForQuestionAnswering",
+    "Qwen3PreTrainedModel",
+    "Qwen3Model",
+    "Qwen3ForSequenceClassification",
+    "Qwen3ForTokenClassification",
 ]

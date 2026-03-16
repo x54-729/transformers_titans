@@ -45,8 +45,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from .configuration_qwen3 import Qwen3MACConfig
-# from .neural_memory import BatchNeuralMemory, BatchNeuralMemoryV2, BatchNeuralMemoryV3, BatchNeuralMemoryV4, NeuralMemory, debug_print
-from .neural_memory import BatchNeuralMemoryV3, debug_print
+from .neural_memory import NeuralMemory, debug_print
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -243,16 +242,18 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         self.config = config
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
-        # self.mlp = Qwen3MLP(config)
+        self.has_mlp = config.has_mlp
+        if config.has_mlp:
+            self.mlp = Qwen3MLP(config)
         # self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         # Titans
-        # self.neural_memory = BatchNeuralMemory(config)
-        self.neural_memory = BatchNeuralMemoryV3(config)
+        self.neural_memory = NeuralMemory(config)
         self.num_persist_mem = config.titans["num_persist_mem"]
+        assert self.num_persist_mem >= 0
         if self.num_persist_mem > 0:
             self.persist_mem = nn.Parameter(torch.randn(1, self.num_persist_mem, self.hidden_size) * 0.02)
         self.gate = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -277,15 +278,9 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
 
         # hidden_states = self.input_layernorm(hidden_states)
-
         if self.num_persist_mem > 0:
             persist_mem = self.persist_mem.expand(bsz, -1, -1)
-        if isinstance(self.neural_memory, (BatchNeuralMemory, NeuralMemory)):
-            memory_params = self.neural_memory.get_memory_params(bsz)
-        elif  isinstance(self.neural_memory, (BatchNeuralMemoryV2, BatchNeuralMemoryV3, BatchNeuralMemoryV4)):
-            memory_params = self.neural_memory.get_memory_params()
-        else:
-            raise NotImplementedError(type(self.neural_memory))
+        memory_params = self.neural_memory.get_memory_params()
         surprises = None
         loss_list, grad_norm_dict = [], {}
         for i in range(num_segments):
@@ -350,16 +345,21 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
 
             # concat_states = self.post_attention_layernorm(concat_states)
 
-            latest_memory, memory_params, surprises, aux = self.neural_memory(concat_states, memory_params, surprises, mask=memory_mask)
+            latest_memory = self.neural_memory.retrieve(concat_states, memory_params, mask=memory_mask)
 
-            loss_list.extend(aux[0])
-            for name, value in aux[1].items():
-                if name not in grad_norm_dict:
-                    grad_norm_dict[name] = []
-                grad_norm_dict[name].extend(value)
+            if i != num_segments - 1:
+                memory_params, surprises, aux = self.neural_memory.store(concat_states, memory_params, surprises, mask=memory_mask)
+                loss_list.extend(aux[0])
+                for name, value in aux[1].items():
+                    if name not in grad_norm_dict:
+                        grad_norm_dict[name] = []
+                    grad_norm_dict[name].extend(value)
 
             # gate before output TODO
             concat_states = self.gate(self.output_layernorm(latest_memory * concat_states))
+
+            if self.has_mlp:
+                concat_states = self.mlp(concat_states)
 
             hidden_states_list.append(concat_states[:, prefix_len:])
 

@@ -173,7 +173,7 @@ def resume_model(work_dir, model_class, model_config, tokenizer_path):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     model.train()
 
-    if config.IS_MEMORY_WARMUP:
+    if config.IS_V2:
         gradient_checkpointing_kwargs = {"use_reentrant": False}
         find_unused_parameters = True
     else:
@@ -281,9 +281,6 @@ args = parser.parse_args()
 
 config = Config.fromfile(args.config)
 
-config.MEMORY_WARMUP = config.get("MEMORY_WARMUP", 0)
-config.IS_MEMORY_WARMUP = config.get("IS_MEMORY_WARMUP", False)
-
 monkey_patch_hf_modules_cache()
 
 if not dist.is_initialized():
@@ -378,9 +375,7 @@ while cur_step < config.TOTAL_STEPS:
     shifted_labels = torch.cat(shifted_labels, dim=0)[:, :cur_max_len]
     attention_mask = torch.cat(attention_mask, dim=0)[:, :cur_max_len]
 
-    update_memory = (cur_step + 1) >= config.MEMORY_WARMUP
-
-    output_tuple = model(input_ids, attention_mask=attention_mask, update_memory=update_memory)
+    output_tuple = model(input_ids, attention_mask=attention_mask)
     if isinstance(output_tuple, tuple):
         output, aux_list = output_tuple
     else:
@@ -410,6 +405,7 @@ while cur_step < config.TOTAL_STEPS:
                 nan_inf_flag = True
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.MAX_GRAD_NORM)
+    grad_norm_after = torch.nn.utils.get_total_norm([p.grad for p in model.parameters() if p.grad is not None])
 
     if getattr(config, "DEBUG", False):
         per_grad_norm_after = {}
@@ -420,10 +416,12 @@ while cur_step < config.TOTAL_STEPS:
 
     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
         logger.info(f"Gradient norm {grad_norm} is invalid, skipping optimizer step.")
-        optimizer.zero_grad()
+    # elif grad_norm.item() >= 100:
+    #     logger.info(f"Gradient norm {grad_norm} is too large, skipping optimizer step.")
     else:
         optimizer.step()
-        optimizer.zero_grad()
+    
+    optimizer.zero_grad()
 
     lr_scheduler.step()
 
@@ -449,15 +447,17 @@ while cur_step < config.TOTAL_STEPS:
     total_time = step_end_time - start_time
     logger.info(
         f"[RANK {RANK}] {cur_step}/{config.TOTAL_STEPS} : "
-        f"Loss: {reduced_loss:.6f} Grad Norm: {grad_norm:.6e} LR: {lr:.6e} "
+        f"Loss: {loss:.6f} | {reduced_loss:.6f} Grad Norm: {grad_norm:.6e} | {grad_norm_after:.6e} LR: {lr:.6e} "
         f"Rank Step Tokens: {step_consumed_tokens} Rank Total Tokens: {consumed_tokens} "
         f"Step Tokens: {all_step_tokens} Total Tokens: {all_total_tokens} "
         f"Time: {step_time:.2f}s Total Time: {total_time:.2f}s Tgs: {tgs:.4f} "
         f"Input Shape {input_ids.shape}"
     )
     log_scalars = {
-        "loss": reduced_loss,
-        "grad_norm": grad_norm.item(),
+        "loss/reduced_loss": reduced_loss,
+        "loss/rank_loss": loss.item(),
+        "grad_norm/before": grad_norm.item(),
+        "grad_norm/after": grad_norm_after.item(),
         "lr": lr,
         "tokens/rank_step": step_consumed_tokens,
         "tokens/rank_total": consumed_tokens,
@@ -477,10 +477,19 @@ while cur_step < config.TOTAL_STEPS:
     if aux_list is not None:
         for layer_idx, aux in enumerate(aux_list):
             loss_list, grad_norm_dict = aux
-            log_scalars[f"inner_loss/layer_{layer_idx}"] = sum(loss_list) / len(loss_list)
-            for name, value in grad_norm_dict.items():
-                log_scalars[f"{name}_grad_norm/layer_{layer_idx}"] = sum(value) / len(value)
+            if len(loss_list) != 0:
+                log_scalars[f"inner_loss/layer_{layer_idx}"] = sum(loss_list) / len(loss_list)
+                for name, value in grad_norm_dict.items():
+                    log_scalars[f"{name}_grad_norm/layer_{layer_idx}"] = sum(value) / len(value)
+            else:
+                log_scalars[f"inner_loss/layer_{layer_idx}"] = 0
+                for name, value in grad_norm_dict.items():
+                    log_scalars[f"{name}_grad_norm/layer_{layer_idx}"] = 0
     exp_tracker.add_scalars(tag_scalar_dict=log_scalars, global_step=cur_step)
+
+    # if nan_inf_flag:
+    #     logger.info("Nan or Inf in grad, exit.")
+    #     break
 
     if cur_step % config.SAVE_FREQ == 0 or cur_step == config.TOTAL_STEPS:
         save_dir = os.path.join(os.path.join(config.WORK_DIR, f"step-{cur_step}"))
@@ -490,13 +499,11 @@ while cur_step < config.TOTAL_STEPS:
         savedir_legacy = os.path.join(os.path.join(config.WORK_DIR, f"snapshot_legacy"))
         if RANK == 0 and os.path.exists(save_dir):
             shutil.move(save_dir, savedir_legacy)
+        dist.barrier()
         save_model_and_states(save_dir, cur_step, consumed_tokens, consumed_samples, model, optimizer, lr_scheduler, dataloader)
+        dist.barrier()
         if RANK == 0 and os.path.exists(savedir_legacy):
             shutil.rmtree(savedir_legacy)
-
-    if nan_inf_flag:
-        logger.info("Nan or Inf in grad, exit.")
-        break
 
     if cur_step % 50 == 0:
         torch.cuda.empty_cache()

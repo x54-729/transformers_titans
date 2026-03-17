@@ -326,8 +326,13 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
 
             cur_attention_mask = torch.zeros(bsz, 1, full_len, full_len, dtype=post_mask.dtype, device=post_mask.device)
             # mask for persist mem & memory, all available
-            cur_attention_mask[:, :, :, :prefix_len] = True
+            if self.num_persist_mem > 0:
+                cur_attention_mask[:, :, :, :self.num_persist_mem] = True
+            cur_attention_mask[:, :, self.num_persist_mem:prefix_len, self.num_persist_mem:prefix_len] = post_mask
+            cur_attention_mask[:, :, prefix_len:, self.num_persist_mem:prefix_len] = post_mask
             cur_attention_mask[:, :, prefix_len:, prefix_len:] = post_mask
+            # cur_attention_mask[:, :, :, :prefix_len] = True
+            # cur_attention_mask[:, :, prefix_len:, prefix_len:] = post_mask
             if self.config._attn_implementation == "eager":
                 min_dtype = torch.finfo(torch.float32).min
                 cur_attention_mask = torch.where(cur_attention_mask, torch.tensor(0.0, device=cur_attention_mask.device, dtype=torch.float32), min_dtype)
@@ -441,8 +446,11 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        layer_cls = Qwen3MACDecoderLayer
+        # layer_cls = Qwen3MACDecoderLayerOrigin
+        # layer_cls = Qwen3MACDecoderLayerSimple
         self.layers = nn.ModuleList(
-            [Qwen3MACDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [layer_cls(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False

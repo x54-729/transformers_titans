@@ -46,6 +46,18 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from .configuration_qwen3 import Qwen3MACConfig
 from .neural_memory import NeuralMemory, debug_print
+# from generate_utils import TitansGenerationMixin
+
+
+class TitansBaseModelOutputWithPast(BaseModelOutputWithPast):
+    aux_list: Optional[list] = None
+    memory_params_list: Optional[list] = None
+
+
+class TitansCausalLMOutputWithPast(CausalLMOutputWithPast):
+    aux_list: Optional[list] = None
+    memory_params_list: Optional[list] = None
+
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -269,6 +281,7 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        memory_params: Optional[dict] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
@@ -280,7 +293,8 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         # hidden_states = self.input_layernorm(hidden_states)
         if self.num_persist_mem > 0:
             persist_mem = self.persist_mem.expand(bsz, -1, -1)
-        memory_params = self.neural_memory.get_memory_params()
+        if memory_params is None:
+            memory_params = self.neural_memory.get_memory_params(hidden_states)
         surprises = None
         loss_list, grad_norm_dict = [], {}
         for i in range(num_segments):
@@ -336,6 +350,8 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
             if self.config._attn_implementation == "eager":
                 min_dtype = torch.finfo(torch.float32).min
                 cur_attention_mask = torch.where(cur_attention_mask, torch.tensor(0.0, device=cur_attention_mask.device, dtype=torch.float32), min_dtype)
+            else:
+                raise NotImplementedError
 
             concat_states = self.self_attn(
                 hidden_states=concat_states,
@@ -375,7 +391,7 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         # Residual in all blocks
         hidden_states = hidden_states + residual
 
-        return hidden_states, (loss_list, grad_norm_dict)
+        return hidden_states, (loss_list, grad_norm_dict), memory_params
 
 @auto_docstring
 class Qwen3MACPreTrainedModel(PreTrainedModel):
@@ -447,8 +463,7 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         layer_cls = Qwen3MACDecoderLayer
-        # layer_cls = Qwen3MACDecoderLayerOrigin
-        # layer_cls = Qwen3MACDecoderLayerSimple
+        # layer_cls = Qwen3MACDecoderLayerNoMem
         self.layers = nn.ModuleList(
             [layer_cls(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -470,6 +485,7 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        memory_params_list: Optional[list] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -493,24 +509,30 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
         hidden_states = inputs_embeds
 
         aux_list = []
+        new_memory_params_list = []
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             debug_print(f"------------------- layer {i} {torch.cuda.memory.memory_allocated()/1024/1024/1024}B---------------------")
-            hidden_states, aux = decoder_layer(
+            hidden_states, aux, new_memory_params = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                memory_params=memory_params_list[i] if memory_params_list is not None else None
                 **kwargs,
             )
             aux_list.append(aux)
+            if memory_params_list is not None:
+                new_memory_params_list.append(new_memory_params)
 
         hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
+        return TitansBaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
-        ), aux_list
+            aux_list=aux_list,
+            memory_params_list=new_memory_params_list,
+        )
 
 
 @auto_docstring
@@ -529,6 +551,14 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def get_memory_params(self, x):
+        memory_params_list = []
+        for layer in self.model.layers:
+            # TODO
+            memory_params_list.append(layer.neural_memory.get_memory_params(x))
+
+        return memory_params_list
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -542,6 +572,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        memory_params_list: Optional[list] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -566,7 +597,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        outputs, aux_list = self.model(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -574,6 +605,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            memory_params_list=memory_params_list,
             **kwargs,
         )
 
@@ -586,13 +618,15 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        return TitansCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-        ), aux_list
+            aux_list=outputs.aux_list,
+            memory_params_list=outputs.memory_params_list,
+        )
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3MACPreTrainedModel):

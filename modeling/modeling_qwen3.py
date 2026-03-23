@@ -46,7 +46,19 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from .configuration_qwen3 import Qwen3MACConfig
 # from .neural_memory import BatchNeuralMemory, BatchNeuralMemoryV2, BatchNeuralMemoryV3, BatchNeuralMemoryV4, NeuralMemory, debug_print
-from .neural_memory import BatchNeuralMemoryV3, debug_print
+from .neural_memory import BatchNeuralMemoryV3, BatchNeuralMemoryV2, debug_print
+# from .generate_utils import TitansGenerationMixin
+
+
+class TitansBaseModelOutputWithPast(BaseModelOutputWithPast):
+    aux_list: Optional[list] = None
+    memory_params_list: Optional[list] = None
+
+
+class TitansCausalLMOutputWithPast(CausalLMOutputWithPast):
+    aux_list: Optional[list] = None
+    memory_params_list: Optional[list] = None
+
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -251,7 +263,7 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         # Titans
         # self.neural_memory = BatchNeuralMemory(config)
-        self.neural_memory = BatchNeuralMemoryV3(config)
+        self.neural_memory = BatchNeuralMemoryV2(config)
         self.num_persist_mem = config.titans["num_persist_mem"]
         if self.num_persist_mem > 0:
             self.persist_mem = nn.Parameter(torch.randn(1, self.num_persist_mem, self.hidden_size) * 0.02)
@@ -268,6 +280,7 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        memory_params: Optional[dict] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
@@ -277,15 +290,10 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
 
         # hidden_states = self.input_layernorm(hidden_states)
-
         if self.num_persist_mem > 0:
             persist_mem = self.persist_mem.expand(bsz, -1, -1)
-        if isinstance(self.neural_memory, (BatchNeuralMemory, NeuralMemory)):
-            memory_params = self.neural_memory.get_memory_params(bsz)
-        elif  isinstance(self.neural_memory, (BatchNeuralMemoryV2, BatchNeuralMemoryV3, BatchNeuralMemoryV4)):
-            memory_params = self.neural_memory.get_memory_params()
-        else:
-            raise NotImplementedError(type(self.neural_memory))
+        if memory_params is None:
+            memory_params = self.neural_memory.get_memory_params(hidden_states)
         surprises = None
         loss_list, grad_norm_dict = [], {}
         for i in range(num_segments):
@@ -331,7 +339,12 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
 
             cur_attention_mask = torch.zeros(bsz, 1, full_len, full_len, dtype=post_mask.dtype, device=post_mask.device)
             # mask for persist mem & memory, all available
-            cur_attention_mask[:, :, :, :prefix_len] = True
+            # cur_attention_mask[:, :, :, :prefix_len] = True
+            # cur_attention_mask[:, :, prefix_len:, prefix_len:] = post_mask
+            if self.num_persist_mem > 0:
+                cur_attention_mask[:, :, :, :self.num_persist_mem] = True
+            cur_attention_mask[:, :, self.num_persist_mem:prefix_len, self.num_persist_mem:prefix_len] = post_mask
+            cur_attention_mask[:, :, prefix_len:, self.num_persist_mem:prefix_len] = post_mask
             cur_attention_mask[:, :, prefix_len:, prefix_len:] = post_mask
             if self.config._attn_implementation == "eager":
                 min_dtype = torch.finfo(torch.float32).min
@@ -370,7 +383,111 @@ class Qwen3MACDecoderLayer(GradientCheckpointingLayer):
         # Residual in all blocks
         hidden_states = hidden_states + residual
 
-        return hidden_states, (loss_list, grad_norm_dict)
+        return hidden_states, (loss_list, grad_norm_dict), memory_params
+    
+
+class Qwen3MACDecoderLayerNoMem(GradientCheckpointingLayer):
+    """
+    Qwen3 Decoder Layer with MAC
+    """
+    def __init__(self, config: Qwen3MACConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+        # self.mlp = Qwen3MLP(config)
+        # self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_type = config.layer_types[layer_idx]
+
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        self.num_persist_mem = config.titans["num_persist_mem"]
+        self.gate = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.output_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.segment_len = config.titans["segment_len"]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.shape
+        # cut into segments
+        num_segments = math.ceil(seq_len / self.segment_len)
+        hidden_states_list = []
+        residual = hidden_states
+
+        # hidden_states = self.input_layernorm(hidden_states)
+
+        for i in range(num_segments):
+            debug_print(f"======== segment {i} {torch.cuda.memory.memory_allocated()/1024/1024/1024}B ======")
+            # TODO: chunk segment at main model?
+            # create position embeddings to be shared across the decoder layers
+            cur_hidden_states = hidden_states[:, i*self.segment_len:(i+1)*self.segment_len, :]
+            cur_segment_len = cur_hidden_states.shape[1]
+
+            # bsz, seq_len with True and False
+            if attention_mask is not None:
+                assert len(attention_mask.shape) == 2, attention_mask.shape
+                origin_mask = attention_mask[:, i*self.segment_len:(i+1)*self.segment_len]
+            else:
+                origin_mask = None
+
+            concat_states = cur_hidden_states
+
+            position_ids = torch.arange(
+                0, cur_segment_len, device=concat_states.device
+            ).unsqueeze(0)
+            position_embeddings = self.rotary_emb(concat_states, position_ids)
+
+            # causal mask for originial x
+            post_mask = sdpa_mask(
+                bsz,
+                cache_position=position_ids.squeeze(0)[:cur_segment_len],
+                kv_length=cur_segment_len,
+                allow_is_causal_skip=False,
+                attention_mask=origin_mask
+            )
+            # The sliding window alternating layers are not always activated depending on the config
+            if self.attention_type == "sliding_attention":
+                raise NotImplementedError
+
+            cur_attention_mask = post_mask
+            if self.config._attn_implementation == "eager":
+                min_dtype = torch.finfo(torch.float32).min
+                cur_attention_mask = torch.where(cur_attention_mask, torch.tensor(0.0, device=cur_attention_mask.device, dtype=torch.float32), min_dtype)
+
+            concat_states = self.self_attn(
+                hidden_states=concat_states,
+                attention_mask=cur_attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+            # gate before output TODO
+            concat_states = self.gate(self.output_layernorm(concat_states))
+
+            hidden_states_list.append(concat_states)
+
+        # clear rope cache to avoid OOM
+        self.rotary_emb.cache = {}
+
+        hidden_states = torch.cat(hidden_states_list, dim=1)
+        # Residual in all blocks
+        hidden_states = hidden_states + residual
+
+        return hidden_states, ([0], {}), None
+
 
 @auto_docstring
 class Qwen3MACPreTrainedModel(PreTrainedModel):
@@ -441,8 +558,10 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        layer_cls = Qwen3MACDecoderLayer
+        # layer_cls = Qwen3MACDecoderLayerNoMem
         self.layers = nn.ModuleList(
-            [Qwen3MACDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [layer_cls(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
@@ -462,6 +581,7 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        memory_params_list: Optional[list] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -485,24 +605,30 @@ class Qwen3MACModel(Qwen3MACPreTrainedModel):
         hidden_states = inputs_embeds
 
         aux_list = []
+        new_memory_params_list = []
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             debug_print(f"------------------- layer {i} {torch.cuda.memory.memory_allocated()/1024/1024/1024}B---------------------")
-            hidden_states, aux = decoder_layer(
+            hidden_states, aux, new_memory_params = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                memory_params=memory_params_list[i] if memory_params_list is not None else None
                 **kwargs,
             )
             aux_list.append(aux)
+            if memory_params_list is not None:
+                new_memory_params_list.append(new_memory_params)
 
         hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
+        return TitansBaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
-        ), aux_list
+            aux_list=aux_list,
+            memory_params_list=new_memory_params_list,
+        )
 
 
 @auto_docstring
@@ -521,6 +647,14 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def get_memory_params(self, x):
+        memory_params_list = []
+        for layer in self.model.layers:
+            # TODO
+            memory_params_list.append(layer.neural_memory.get_memory_params(x))
+
+        return memory_params_list
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -534,6 +668,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        memory_params_list: Optional[list] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -558,7 +693,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        outputs, aux_list = self.model(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -566,6 +701,7 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            memory_params_list=memory_params_list,
             **kwargs,
         )
 
@@ -578,13 +714,15 @@ class Qwen3MACForCausalLM(Qwen3MACPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        return TitansCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-        ), aux_list
+            aux_list=outputs.aux_list,
+            memory_params_list=outputs.memory_params_list,
+        )
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3MACPreTrainedModel):

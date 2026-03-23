@@ -31,9 +31,6 @@ from xtuner.v1.utils import get_logger, Config
 from xtuner.v1._writer import get_writer
 from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 
-
-from modeling.modeling_qwen3 import Qwen3MACForCausalLM
-from modeling.configuration_qwen3 import Qwen3MACConfig
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from dataloader import InternDataloader, InternDataloaderConfig
@@ -169,7 +166,7 @@ def resume_model(work_dir, model_class, model_config, tokenizer_path):
         model_dir = os.path.join(latest_path, "model")
         tokenizer_path = model_dir
     dist.barrier()
-    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=model_config.torch_dtype, trust_remote_code=True, attn_implementation="eager").cuda()
+    model = AutoModelForCausalLM.from_pretrained(model_dir, trust_remote_code=True, attn_implementation="eager").cuda()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     model.train()
 
@@ -375,11 +372,10 @@ while cur_step < config.TOTAL_STEPS:
     shifted_labels = torch.cat(shifted_labels, dim=0)[:, :cur_max_len]
     attention_mask = torch.cat(attention_mask, dim=0)[:, :cur_max_len]
 
-    output_tuple = model(input_ids, attention_mask=attention_mask)
-    if isinstance(output_tuple, tuple):
-        output, aux_list = output_tuple
-    else:
-        output, aux_list = output_tuple, None
+    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+        output = model(input_ids, attention_mask=attention_mask)
+
+    aux_list = output.get("aux_list", None)
     logits = output.logits.float()
     logits = logits.reshape(-1, logits.size(-1))  # (bs * seq_len, vocab_size)
     shifted_labels = shifted_labels.flatten()

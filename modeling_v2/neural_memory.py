@@ -190,7 +190,7 @@ class NeuralMemory(nn.Module):
 
         self.assocscan_fn = associative_scan
 
-    def get_memory_params(self):
+    def get_memory_params(self, x):
 
         return self.memory.get_single_memory_params()
 

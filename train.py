@@ -138,6 +138,8 @@ def load_dataloader(dataloader, save_path):
     dataloader_state = torch.load(save_path, map_location=DEVICE, weights_only=False)
     dataloader.load_state_dict(dataloader_state)
 
+    del dataloader_state
+
     return dataloader
 
 def find_latest_ckpt(work_dir):
@@ -205,16 +207,23 @@ def resume_states(work_dir, optimizer, scheduler, dataloader):
     else:
         states_dir = os.path.join(latest_path, "states")
 
+        if not config.get("SKIP_SCHEDULER", False):
+            scheduler_path = os.path.join(states_dir, "scheduler")
+            logger.info(f"Resume scheduler from {scheduler_path}")
+            scheduler_states = torch.load(scheduler_path)
+            scheduler.load_state_dict(scheduler_states)
+
         if not config.get("SKIP_OPTIMIZER", False):
-            optimizer_path = os.path.join(states_dir, "optimizer", f"rank{RANK}")
+            optimizer_path = os.path.join(states_dir, "optimizer")
             logger.info(f"Resume optimizer from {optimizer_path}")
             optimizer_states = torch.load(optimizer_path)
             optimizer.load_state_dict(optimizer_states)
 
-        scheduler_path = os.path.join(states_dir, "scheduler")
-        logger.info(f"Resume scheduler from {scheduler_path}")
-        scheduler_states = torch.load(scheduler_path)
-        scheduler.load_state_dict(scheduler_states)
+            del optimizer_states
+        else:
+            # fix scheduler resume when skip optimizer
+            for i, group in enumerate(optimizer.param_groups):
+                group["lr"] = scheduler.get_last_lr()[i]
 
         dataloader_path = os.path.join(states_dir, "dataloader")
         logger.info(f"Resume dataloader from {dataloader_path}")
@@ -233,13 +242,12 @@ def save_model_and_states(save_dir, cur_step, consumed_tokens, consumed_samples,
 
     model_dir = os.path.join(save_dir, "model")
     states_dir = os.path.join(save_dir, "states")
-    optimizer_dir = os.path.join(states_dir, "optimizer")
     meta_dir = os.path.join(states_dir, "meta")
     scheduler_path = os.path.join(states_dir, "scheduler")
-    
+    optimizer_path = os.path.join(states_dir, "optimizer")
+
     if RANK == 0:
         os.makedirs(states_dir, exist_ok=True)
-        os.makedirs(optimizer_dir, exist_ok=True)
         os.makedirs(meta_dir, exist_ok=True)
         scheduler_path = os.path.join(states_dir, "scheduler")
 
@@ -247,11 +255,10 @@ def save_model_and_states(save_dir, cur_step, consumed_tokens, consumed_samples,
         tokenizer.save_pretrained(model_dir)
         # scheduler
         torch.save(lr_scheduler.state_dict(), scheduler_path)
+        # optimizer
+        torch.save(optimizer.state_dict(), optimizer_path)
         
     dist.barrier()
-
-    # optimizer
-    torch.save(optimizer.state_dict(), os.path.join(optimizer_dir, f"rank{RANK}"))
     # dataloader
     save_dataloader(dataloader, os.path.join(states_dir, "dataloader"), data_mesh, consumed_samples)
     # meta
@@ -301,7 +308,6 @@ logger.info(config.pretty_text)
 logger.info(f"==========================================")
 
 model, tokenizer = resume_model(config.WORK_DIR, config.model_class, config.model_config, config.TOKENIZER_PATH)
-# breakpoint()
 
 dataloader_cfg = InternDataloaderConfig(
     config_path=config.INTERNLM_CFG,
@@ -325,19 +331,32 @@ def warmup_fn(x):
     return x / config.WARMUP if x < config.WARMUP else 1
 
 warmup_scheduler = LambdaLR(optimizer, warmup_fn)
-scheduler = LambdaLR(optimizer, lambda x: 1.0)
+if config.LR_TYPE in ["constant", "stable"]:
+    scheduler = LambdaLR(optimizer, lambda x: 1.0)
+elif config.LR_TYPE == "cosine":
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=config.SCHEDULER_STEPS - config.WARMUP, eta_min=config.LR_MIN
+    )
+elif config.LR_TYPE == "linear":
+    scheduler = LinearLR(
+        optimizer, start_factor=1.0, end_factor=config.LR_MIN / config.LR, total_iters=config.SCHEDULER_STEPS - config.WARMUP,
+    )
+else:
+    raise NotImplementedError
 lr_scheduler = SequentialLR(
     optimizer=optimizer,
     schedulers=[warmup_scheduler, scheduler],
     milestones=[config.WARMUP],
 )
 optimizer, lr_scheduler, dataloader, cur_step, consumed_samples, consumed_tokens = resume_states(config.WORK_DIR, optimizer, lr_scheduler, dataloader)
-
 # check grad norm
 torch.autograd.set_detect_anomaly(False)
 
 ######################## Training ##################
 data_iter = iter(dataloader)
+
+torch.cuda.empty_cache()
+gc.collect()
 
 log_dir = os.path.join(config.WORK_DIR, "tensorboard", f"rank{RANK}")
 exp_tracker = get_writer(writer_type="tensorboard", log_dir=log_dir)
@@ -394,10 +413,10 @@ while cur_step < config.TOTAL_STEPS:
                 continue
             per_grad_norm_before[name] = torch.norm(param.grad).item()
             if torch.isnan(param.grad).any().item():
-                logger.info("nan:", name)
+                logger.info(f"nan: {name}")
                 nan_inf_flag = True
             if torch.isinf(param.grad).any().item():
-                logger.info("inf:", name)
+                logger.info(f"inf: {name}")
                 nan_inf_flag = True
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.MAX_GRAD_NORM)
